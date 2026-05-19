@@ -1,0 +1,113 @@
+# Itinera — AI Itinerary Generator (MVP)
+
+Hyper-personalized travel itineraries powered by **xAI Grok**, with a FastAPI backend and Streamlit frontend.
+
+## Features
+
+- **Structured preferences**: destination, duration, travel party, pace, budget tier, and multi-select interests
+- **AI-generated daily plans**: Morning → Lunch → Afternoon → Evening blocks with costs and coordinates
+- **Progressive Foodie Tour**: lunch blocks paired with nearby dessert/coffee walking routes
+- **Hidden gems**: low-crowd local favorites flagged in the itinerary
+- **Retry on bad JSON**: automatic retries when LLM output fails validation
+- **In-memory store**: typed dict storage, ready to swap for PostgreSQL/PostGIS
+
+## Project structure
+
+```
+Itinera/
+├── app.py                 # Streamlit frontend entrypoint
+├── main.py                # FastAPI backend entrypoint
+├── schemas.py             # Pydantic data models
+├── config.py              # Environment-based settings
+├── requirements.txt
+├── services/
+│   └── ai_engine.py       # LLM prompts, parsing, retries
+├── routers/
+│   └── itinerary.py       # REST API routes
+├── data/
+│   └── store.py           # In-memory itinerary store
+└── frontend/
+    ├── api_client.py      # HTTP client for backend
+    └── components.py      # Streamlit UI components
+```
+
+## Quick start
+
+### 1. Install dependencies
+
+```bash
+cd Itinera
+python -m venv .venv
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### 2. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+For local development without an API key, set `USE_MOCK_LLM=true` in `.env`.
+
+To use xAI Grok, set your key and disable mock mode:
+
+```env
+XAI_API_KEY=xai-...
+XAI_MODEL=grok-4.3
+USE_MOCK_LLM=false
+```
+
+### 3. Start the backend
+
+```bash
+uvicorn main:app --reload --host 127.0.0.1 --port 8000
+```
+
+API docs: http://127.0.0.1:8000/docs
+
+### 4. Start the frontend
+
+In a second terminal:
+
+```bash
+streamlit run app.py
+```
+
+Open http://localhost:8501, configure your trip in the sidebar, and click **Generate Itinerary**.
+
+## API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/health` | Health check |
+| `POST` | `/api/itinerary/generate` | Generate and store an itinerary |
+| `GET` | `/api/itinerary/{id}` | Fetch itinerary by ID |
+| `GET` | `/api/itinerary` | List all stored itineraries |
+
+### Example request
+
+```bash
+curl -X POST http://127.0.0.1:8000/api/itinerary/generate \
+  -H "Content-Type: application/json" \
+  -d '{
+    "preferences": {
+      "destination": "Tokyo",
+      "duration_days": 2,
+      "travel_party": "Couple",
+      "pace": "Moderate",
+      "budget_tier": "Mid-range",
+      "interests": ["Foodie", "Culture", "Hidden Gems"]
+    }
+  }'
+```
+
+## Architecture notes
+
+- **Business logic** lives in `services/ai_engine.py` (prompts, JSON parsing, validation, retries).
+- **Presentation** lives in `frontend/components.py` and `app.py`.
+- **Data layer** is `data/store.py` — replace `InMemoryItineraryStore` with a DB repository when ready.
+
+## License
+
+MIT
