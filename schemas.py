@@ -68,8 +68,8 @@ class UserPreferences(BaseModel):
         return value.strip()
 
 
-class Activity(BaseModel):
-    """Single activity within a time block."""
+class ActivityLLMOutput(BaseModel):
+    """Activity fields produced by the LLM before map verification."""
 
     activity_name: str
     description: str
@@ -77,6 +77,20 @@ class Activity(BaseModel):
     latitude: Annotated[float, Field(ge=-90, le=90)]
     longitude: Annotated[float, Field(ge=-180, le=180)]
     hidden_gem: bool = False
+
+
+class Activity(ActivityLLMOutput):
+    """Single activity with map-verified location metadata."""
+
+    is_verified: bool = False
+    formatted_address: str | None = None
+
+
+class TimeBlockLLM(BaseModel):
+    """Time block as returned by the LLM."""
+
+    time_slot: TimeSlot
+    activity: ActivityLLMOutput
 
 
 class TimeBlock(BaseModel):
@@ -108,8 +122,23 @@ class DayItinerary(BaseModel):
         return blocks
 
 
+class DayItineraryLLMOutput(BaseModel):
+    """One day schedule as returned by the LLM."""
+
+    day_number: Annotated[int, Field(ge=1)]
+    time_blocks: list[TimeBlockLLM]
+
+
+class ItineraryPlanLLMOutput(BaseModel):
+    """Itinerary payload from Grok before location anchoring."""
+
+    destination: str
+    duration_days: int
+    days: list[DayItineraryLLMOutput]
+
+
 class ItineraryPlan(BaseModel):
-    """Complete multi-day itinerary returned by the AI engine."""
+    """Complete multi-day itinerary with verified location metadata."""
 
     destination: str
     duration_days: int
@@ -139,9 +168,38 @@ class ItineraryGenerateResponse(BaseModel):
 
 
 class ItineraryRecord(BaseModel):
-    """Persisted itinerary record in the in-memory store."""
+    """Persisted itinerary record from the database."""
 
     itinerary_id: str
     preferences: UserPreferences
     plan: ItineraryPlan
     created_at: str
+
+
+class ItinerarySummary(BaseModel):
+    """Lightweight listing for sidebar history."""
+
+    itinerary_id: str
+    destination: str
+    duration_days: int
+    budget_tier: BudgetTier
+    created_at: str
+    label: str
+
+
+# Daily budget guidance (USD) by tier for burn-rate metrics
+DAILY_BUDGET_BY_TIER: dict[BudgetTier, float] = {
+    BudgetTier.BUDGET: 75.0,
+    BudgetTier.MID_RANGE: 150.0,
+    BudgetTier.LUXURY: 350.0,
+}
+
+
+def daily_budget_allocation(tier: BudgetTier) -> float:
+    """Return the recommended daily spend for a budget tier."""
+    return DAILY_BUDGET_BY_TIER[tier]
+
+
+def day_estimated_cost(day: DayItinerary) -> float:
+    """Sum estimated activity costs for a single day."""
+    return sum(block.activity.estimated_cost for block in day.time_blocks)

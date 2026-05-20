@@ -9,7 +9,10 @@ Hyper-personalized travel itineraries powered by **xAI Grok**, with a FastAPI ba
 - **Progressive Foodie Tour**: lunch blocks paired with nearby dessert/coffee walking routes
 - **Hidden gems**: low-crowd local favorites flagged in the itinerary
 - **Retry on bad JSON**: automatic retries when LLM output fails validation
-- **In-memory store**: typed dict storage, ready to swap for PostgreSQL/PostGIS
+- **SQLite persistence**: SQLAlchemy async layer (`database.py`), migratable to PostgreSQL
+- **Structured Grok outputs**: native `json_schema` with Pydantic-backed validation
+- **Geocoding fallbacks**: `geopy` + city bounding-box offsets so maps never break
+- **Saved trips**: reload historical itineraries from the sidebar without re-calling xAI
 
 ## Project structure
 
@@ -19,9 +22,12 @@ Itinera/
 ├── main.py                # FastAPI backend entrypoint
 ├── schemas.py             # Pydantic data models
 ├── config.py              # Environment-based settings
+├── database.py            # SQLAlchemy async ORM (SQLite / Postgres)
 ├── requirements.txt
 ├── services/
-│   └── ai_engine.py       # LLM prompts, parsing, retries
+│   ├── ai_engine.py       # Grok structured outputs, parsing, retries
+│   ├── db_service.py      # Itinerary CRUD
+│   └── geocoding.py       # Coordinate validation & fallbacks
 ├── routers/
 │   └── itinerary.py       # REST API routes
 ├── data/
@@ -106,7 +112,7 @@ curl -X POST http://127.0.0.1:8000/api/itinerary/generate \
 
 - **Business logic** lives in `services/ai_engine.py` (prompts, JSON parsing, validation, retries).
 - **Presentation** lives in `frontend/components.py` and `app.py`.
-- **Data layer** is `data/store.py` — replace `InMemoryItineraryStore` with a DB repository when ready.
+- **Data layer** is `database.py` + `services/db_service.py`. Set `DATABASE_URL=postgresql+asyncpg://...` for production.
 
 ## License
 

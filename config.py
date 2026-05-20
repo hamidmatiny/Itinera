@@ -32,6 +32,11 @@ class Settings(BaseSettings):
         alias="API_BASE_URL",
     )
     use_mock_llm: bool = Field(default=False, alias="USE_MOCK_LLM")
+    database_url: str = Field(
+        default="sqlite+aiosqlite:///./itinera.db",
+        alias="DATABASE_URL",
+    )
+    database_echo: bool = Field(default=False, alias="DATABASE_ECHO")
 
     @property
     def has_xai_credentials(self) -> bool:

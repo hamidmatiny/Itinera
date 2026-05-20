@@ -1,4 +1,4 @@
-"""LLM interaction, prompt engineering, and itinerary parsing via xAI (Grok)."""
+"""LLM interaction, structured outputs, and itinerary parsing via xAI (Grok)."""
 
 from __future__ import annotations
 
@@ -13,61 +13,73 @@ from pydantic import ValidationError
 from config import Settings, XAI_MISSING_KEY_MESSAGE, get_settings
 from schemas import (
     Activity,
+    ActivityLLMOutput,
     DayItinerary,
     Interest,
     ItineraryPlan,
+    ItineraryPlanLLMOutput,
     TimeBlock,
     TimeSlot,
     UserPreferences,
 )
 from services.exceptions import XAIConfigurationError, XAIConnectionError
+from services.geocoding import anchor_itinerary_locations
 
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = """You are Grok, an expert travel planner AI. Generate hyper-personalized daily itineraries.
 
-STRICT OUTPUT RULES:
-1. Return ONLY valid minified JSON matching the schema below. No markdown fences, no commentary, no prose before or after the JSON.
-2. Each day MUST contain exactly four time_blocks: Morning, Lunch, Afternoon, Evening (in that order).
-3. Every activity MUST include: activity_name, description, estimated_cost (USD number), latitude, longitude, hidden_gem (boolean).
-4. Coordinates must be realistic for the destination (valid lat/lng).
-5. Costs must align with the user's budget tier.
-6. Pace affects activity density: Relaxed = fewer/longer stops, Packed = more ambitious routing.
-7. Honor all selected interest tags across the trip.
+RULES:
+1. Each day MUST contain exactly four time_blocks: Morning, Lunch, Afternoon, Evening.
+2. VENUE AUTHENTICITY (CRITICAL): Only recommend globally renowned, well-documented, real-world establishments that exist today (museums, famous restaurants, major parks, iconic landmarks). NEVER invent fictional cafés, shops, or attractions. Use exact official venue names as they appear on maps.
+3. Coordinates are advisory only — they will be verified against OpenStreetMap post-generation. Still provide plausible latitude/longitude for each activity.
+4. Costs must align with the user's budget tier.
+5. Pace affects activity density: Relaxed = fewer/longer stops, Packed = more ambitious routing.
+6. Honor all selected interest tags across the trip.
 
 PROGRESSIVE FOODIE TOUR (MANDATORY when Foodie is selected):
 - For EVERY Lunch time_block, pair the main lunch venue with a nearby dessert shop OR specialty coffee roaster.
-- The Lunch activity description MUST describe: (a) the primary lunch spot, (b) a 5–15 minute walking route to the dessert/coffee stop, and (c) why they pair well locally.
-- Afternoon block on Foodie days should complement the lunch route (e.g., market stroll, food hall) when possible.
+- The Lunch description MUST describe: (a) the primary lunch spot, (b) a 5–15 minute walking route to dessert/coffee, and (c) why they pair well locally.
 
 HIDDEN GEMS:
-- Mark hidden_gem=true for low-crowd, local-favorite spots not in typical guidebooks.
+- Mark hidden_gem=true for low-crowd, local-favorite spots.
 - Include at least one hidden_gem activity per day when Hidden Gems interest is selected.
-
-JSON SCHEMA:
-{
-  "destination": "string",
-  "duration_days": number,
-  "days": [
-    {
-      "day_number": 1,
-      "time_blocks": [
-        {
-          "time_slot": "Morning|Lunch|Afternoon|Evening",
-          "activity": {
-            "activity_name": "string",
-            "description": "string",
-            "estimated_cost": 0.0,
-            "latitude": 0.0,
-            "longitude": 0.0,
-            "hidden_gem": false
-          }
-        }
-      ]
-    }
-  ]
-}
 """
+
+
+def _build_strict_json_schema() -> dict[str, Any]:
+    """Build xAI/OpenAI-compatible strict JSON schema from Pydantic models."""
+    schema = ItineraryPlanLLMOutput.model_json_schema(ref_template="#/$defs/{model}")
+
+    def _apply_strict(node: dict[str, Any]) -> None:
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object" and "properties" in node:
+            node["additionalProperties"] = False
+            props = node["properties"]
+            if props:
+                node["required"] = list(props.keys())
+        for value in node.values():
+            if isinstance(value, dict):
+                _apply_strict(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        _apply_strict(item)
+
+    _apply_strict(schema)
+    if "$defs" in schema:
+        for def_schema in schema["$defs"].values():
+            _apply_strict(def_schema)
+
+    return schema
+
+
+_ITINERARY_JSON_SCHEMA: dict[str, Any] = {
+    "name": "itinerary_plan",
+    "strict": True,
+    "schema": _build_strict_json_schema(),
+}
 
 
 class AIItineraryEngine:
@@ -94,11 +106,12 @@ class AIItineraryEngine:
         """
         Generate a validated itinerary plan.
 
-        Uses xAI Grok with retries, or falls back to a deterministic mock when enabled.
+        Uses xAI Grok structured outputs with retries, or mock when enabled.
         """
         if self._settings.use_mock_llm:
             logger.warning("USE_MOCK_LLM enabled; using mock itinerary generator.")
-            return self._generate_mock(preferences)
+            plan = self._generate_mock(preferences)
+            return await anchor_itinerary_locations(plan)
 
         if self._client is None:
             raise XAIConfigurationError(XAI_MISSING_KEY_MESSAGE)
@@ -108,6 +121,7 @@ class AIItineraryEngine:
             try:
                 raw = await self._call_llm(preferences)
                 plan = self._parse_and_validate(raw, preferences)
+                plan = await anchor_itinerary_locations(plan)
                 logger.info(
                     "Itinerary generated successfully on attempt %d for %s",
                     attempt,
@@ -146,23 +160,60 @@ Budget tier: {preferences.budget_tier.value}
 Interests: {interests}
 {foodie_note}
 
-Return exactly {preferences.duration_days} days of activities as minified JSON only."""
+Return exactly {preferences.duration_days} days of activities."""
 
     async def _call_llm(self, preferences: UserPreferences) -> str:
-        """Invoke xAI Grok via the OpenAI-compatible chat completions API."""
+        """Invoke xAI Grok with native structured JSON schema output."""
         if self._client is None:
             raise XAIConfigurationError(XAI_MISSING_KEY_MESSAGE)
+
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": self._build_user_prompt(preferences)},
+        ]
 
         try:
             response = await self._client.chat.completions.create(
                 model=self._settings.xai_model,
-                response_format={"type": "json_object"},
-                messages=[
-                    {"role": "system", "content": SYSTEM_PROMPT},
-                    {"role": "user", "content": self._build_user_prompt(preferences)},
-                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": _ITINERARY_JSON_SCHEMA,
+                },
+                messages=messages,
                 temperature=0.7,
             )
+        except APIStatusError as exc:
+            if exc.status_code in (400, 422):
+                logger.warning(
+                    "json_schema rejected (%s); falling back to json_object mode",
+                    exc.status_code,
+                )
+                try:
+                    response = await self._client.chat.completions.create(
+                        model=self._settings.xai_model,
+                        response_format={"type": "json_object"},
+                        messages=messages,
+                        temperature=0.7,
+                    )
+                except APIStatusError as fallback_exc:
+                    logger.error(
+                        "xAI API error on fallback: %s",
+                        fallback_exc.message,
+                        exc_info=True,
+                    )
+                    raise XAIConnectionError(
+                        f"xAI API error ({fallback_exc.status_code}). Please try again later."
+                    ) from fallback_exc
+            else:
+                logger.error(
+                    "xAI API returned HTTP %s: %s",
+                    exc.status_code,
+                    exc.message,
+                    exc_info=True,
+                )
+                raise XAIConnectionError(
+                    f"xAI API error ({exc.status_code}). Please try again later."
+                ) from exc
         except AuthenticationError as exc:
             logger.error("xAI authentication failed: %s", exc, exc_info=True)
             raise XAIConnectionError(
@@ -172,16 +223,6 @@ Return exactly {preferences.duration_days} days of activities as minified JSON o
             logger.error("xAI connection error: %s", exc, exc_info=True)
             raise XAIConnectionError(
                 "Unable to reach the xAI API. Check your network connection and try again."
-            ) from exc
-        except APIStatusError as exc:
-            logger.error(
-                "xAI API returned HTTP %s: %s",
-                exc.status_code,
-                exc.message,
-                exc_info=True,
-            )
-            raise XAIConnectionError(
-                f"xAI API error ({exc.status_code}). Please try again later."
             ) from exc
 
         content = response.choices[0].message.content
@@ -205,9 +246,40 @@ Return exactly {preferences.duration_days} days of activities as minified JSON o
         payload: dict[str, Any] = json.loads(raw_json)
         payload["destination"] = preferences.destination
         payload["duration_days"] = preferences.duration_days
-        plan = ItineraryPlan.model_validate(payload)
+        llm_plan = ItineraryPlanLLMOutput.model_validate(payload)
+        plan = self._to_verified_plan(llm_plan)
         self._assert_progressive_foodie_tour(plan, preferences)
         return plan
+
+    @staticmethod
+    def _to_verified_plan(llm_plan: ItineraryPlanLLMOutput) -> ItineraryPlan:
+        """Convert LLM output into a plan ready for location anchoring."""
+        days: list[DayItinerary] = []
+        for day in llm_plan.days:
+            blocks: list[TimeBlock] = []
+            for block in day.time_blocks:
+                llm_activity = block.activity
+                blocks.append(
+                    TimeBlock(
+                        time_slot=block.time_slot,
+                        activity=Activity(
+                            activity_name=llm_activity.activity_name,
+                            description=llm_activity.description,
+                            estimated_cost=llm_activity.estimated_cost,
+                            latitude=llm_activity.latitude,
+                            longitude=llm_activity.longitude,
+                            hidden_gem=llm_activity.hidden_gem,
+                            is_verified=False,
+                            formatted_address=None,
+                        ),
+                    )
+                )
+            days.append(DayItinerary(day_number=day.day_number, time_blocks=blocks))
+        return ItineraryPlan(
+            destination=llm_plan.destination,
+            duration_days=llm_plan.duration_days,
+            days=days,
+        )
 
     def _assert_progressive_foodie_tour(
         self, plan: ItineraryPlan, preferences: UserPreferences

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from database import init_db
 from routers.itinerary import router as itinerary_router
 
 logging.basicConfig(
@@ -14,10 +16,22 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 
+logger = logging.getLogger(__name__)
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    """Initialize database on startup."""
+    await init_db()
+    logger.info("Database initialized")
+    yield
+
+
 app = FastAPI(
     title="Itinera API",
     description="Hyper-personalized AI itinerary generation service",
-    version="0.1.0",
+    version="0.2.0",
+    lifespan=lifespan,
 )
 
 app.add_middleware(

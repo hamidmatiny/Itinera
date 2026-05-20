@@ -6,12 +6,13 @@ import logging
 
 from fastapi import APIRouter, HTTPException, status
 
-from data.store import itinerary_store
 from schemas import (
     ItineraryGenerateRequest,
     ItineraryGenerateResponse,
     ItineraryRecord,
+    ItinerarySummary,
 )
+from services import db_service
 from services.ai_engine import AIItineraryEngine
 from services.exceptions import XAIConfigurationError, XAIConnectionError
 
@@ -41,7 +42,7 @@ async def generate_itinerary(
     """
     Generate a personalized itinerary from user preferences.
 
-    Persists the result in the in-memory store and returns the plan.
+    Persists the result in the database and returns the plan.
     """
     preferences = body.preferences
     try:
@@ -72,17 +73,24 @@ async def generate_itinerary(
             detail="An unexpected error occurred while generating the itinerary.",
         ) from exc
 
-    record = itinerary_store.save(preferences, plan)
+    record = await db_service.save_itinerary(preferences, plan)
     return ItineraryGenerateResponse(
         itinerary_id=record.itinerary_id,
         plan=record.plan,
     )
 
 
+@router.get("/summaries", response_model=list[ItinerarySummary])
+async def list_itinerary_summaries() -> list[ItinerarySummary]:
+    """List lightweight summaries for sidebar history."""
+    rows = await db_service.list_itinerary_summaries()
+    return [ItinerarySummary.model_validate(row) for row in rows]
+
+
 @router.get("/{itinerary_id}", response_model=ItineraryRecord)
 async def get_itinerary(itinerary_id: str) -> ItineraryRecord:
     """Fetch a previously generated itinerary by ID."""
-    record = itinerary_store.get(itinerary_id)
+    record = await db_service.get_itinerary(itinerary_id)
     if record is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -94,4 +102,4 @@ async def get_itinerary(itinerary_id: str) -> ItineraryRecord:
 @router.get("", response_model=list[ItineraryRecord])
 async def list_itineraries() -> list[ItineraryRecord]:
     """List all stored itineraries."""
-    return itinerary_store.list_all()
+    return await db_service.list_itineraries()

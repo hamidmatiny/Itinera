@@ -5,7 +5,12 @@ from __future__ import annotations
 import httpx
 
 from config import get_settings
-from schemas import ItineraryGenerateResponse, UserPreferences
+from schemas import (
+    ItineraryGenerateResponse,
+    ItineraryRecord,
+    ItinerarySummary,
+    UserPreferences,
+)
 
 
 class ItineraryAPIError(Exception):
@@ -51,6 +56,36 @@ class ItineraryAPIClient:
         except httpx.HTTPError as exc:
             raise ItineraryAPIError(
                 "A network error occurred while contacting the itinerary API."
+            ) from exc
+
+    def list_summaries(self) -> list[ItinerarySummary]:
+        """Fetch saved trip summaries for the sidebar."""
+        try:
+            with httpx.Client(timeout=10.0) as client:
+                response = client.get(f"{self._base_url}/api/itinerary/summaries")
+                response.raise_for_status()
+                return [
+                    ItinerarySummary.model_validate(item)
+                    for item in response.json()
+                ]
+        except httpx.HTTPError:
+            return []
+
+    def get_itinerary(self, itinerary_id: str) -> ItineraryRecord:
+        """Load a saved itinerary without re-invoking xAI."""
+        try:
+            with httpx.Client(timeout=15.0) as client:
+                response = client.get(
+                    f"{self._base_url}/api/itinerary/{itinerary_id}"
+                )
+                response.raise_for_status()
+                return ItineraryRecord.model_validate(response.json())
+        except httpx.HTTPStatusError as exc:
+            detail = self._extract_error_detail(exc.response)
+            raise ItineraryAPIError(detail, status_code=exc.response.status_code) from exc
+        except httpx.HTTPError as exc:
+            raise ItineraryAPIError(
+                "Failed to load the saved itinerary."
             ) from exc
 
     @staticmethod

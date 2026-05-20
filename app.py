@@ -13,6 +13,7 @@ from frontend.components import (
     render_map_view,
     render_sidebar,
 )
+from schemas import ItineraryPlan, UserPreferences
 
 st.set_page_config(
     page_title="Itinera — AI Itinerary Generator",
@@ -42,6 +43,33 @@ def _render_api_error(exc: ItineraryAPIError) -> None:
         st.error(f"**Failed to generate itinerary** — {exc.message}")
 
 
+def _render_dashboard(
+    plan: ItineraryPlan,
+    preferences: UserPreferences,
+    itinerary_id: str,
+    *,
+    from_saved: bool = False,
+) -> None:
+    """Render the main tabs for a loaded or newly generated itinerary."""
+    if from_saved:
+        st.success(f"Loaded saved trip · `{itinerary_id[:8]}…` · {plan.destination}")
+    else:
+        st.success(f"Itinerary ready · ID `{itinerary_id[:8]}…`")
+
+    tab_daily, tab_foodie, tab_map = st.tabs(
+        ["Daily Itinerary", "Foodie & Hidden Gems", "Map View"]
+    )
+
+    with tab_daily:
+        render_daily_itinerary(plan, preferences)
+
+    with tab_foodie:
+        render_foodie_hidden_gems(plan)
+
+    with tab_map:
+        render_map_view(plan)
+
+
 def main() -> None:
     """Application entrypoint."""
     st.title("Itinera")
@@ -57,41 +85,52 @@ def main() -> None:
             "`uvicorn main:app --reload`"
         )
 
-    preferences = render_sidebar()
-    if preferences is None:
-        st.info("Configure your trip in the sidebar, then click **Generate Itinerary**.")
+    sidebar = render_sidebar(client)
+
+    if sidebar.action == "none":
+        st.info(
+            "Select a **Saved Trip** to reopen without calling xAI, or configure a "
+            "new trip and click **Generate Itinerary**."
+        )
         return
 
-    progress = st.empty()
-    with st.spinner("Generating your personalized itinerary with Grok…"):
+    if sidebar.action == "load_saved" and sidebar.itinerary_id:
         try:
-            for message in LOADING_MESSAGES[:-1]:
-                progress.caption(message)
-                time.sleep(0.35)
-            progress.caption(LOADING_MESSAGES[-1])
-            response = client.generate(preferences)
+            record = client.get_itinerary(sidebar.itinerary_id)
         except ItineraryAPIError as exc:
             _render_api_error(exc)
             return
-        except Exception as exc:
-            st.error(f"An unexpected error occurred: {exc}")
-            return
+        _render_dashboard(
+            record.plan,
+            record.preferences,
+            record.itinerary_id,
+            from_saved=True,
+        )
+        return
 
-    plan = response.plan
-    st.success(f"Itinerary ready · ID `{response.itinerary_id[:8]}…`")
+    if sidebar.action == "generate" and sidebar.preferences:
+        preferences = sidebar.preferences
+        progress = st.empty()
+        with st.spinner("Generating your personalized itinerary with Grok…"):
+            try:
+                for message in LOADING_MESSAGES[:-1]:
+                    progress.caption(message)
+                    time.sleep(0.35)
+                progress.caption(LOADING_MESSAGES[-1])
+                response = client.generate(preferences)
+            except ItineraryAPIError as exc:
+                _render_api_error(exc)
+                return
+            except Exception as exc:
+                st.error(f"An unexpected error occurred: {exc}")
+                return
 
-    tab_daily, tab_foodie, tab_map = st.tabs(
-        ["Daily Itinerary", "Foodie & Hidden Gems", "Map View"]
-    )
-
-    with tab_daily:
-        render_daily_itinerary(plan)
-
-    with tab_foodie:
-        render_foodie_hidden_gems(plan)
-
-    with tab_map:
-        render_map_view(plan)
+        _render_dashboard(
+            response.plan,
+            preferences,
+            response.itinerary_id,
+            from_saved=False,
+        )
 
 
 if __name__ == "__main__":

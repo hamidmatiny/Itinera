@@ -1,4 +1,6 @@
 .env
+itinera.db
+*.db
 .venv/
 venv/
 __pycache__/
