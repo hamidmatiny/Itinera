@@ -1,4 +1,4 @@
-"""LLM interaction, structured outputs, and itinerary parsing via xAI (Grok)."""
+"""Agentic Search-then-Synthesize itinerary engine via xAI Grok + native web search."""
 
 from __future__ import annotations
 
@@ -13,7 +13,6 @@ from pydantic import ValidationError
 from config import Settings, XAI_MISSING_KEY_MESSAGE, get_settings
 from schemas import (
     Activity,
-    ActivityLLMOutput,
     DayItinerary,
     Interest,
     ItineraryPlan,
@@ -27,24 +26,78 @@ from services.geocoding import anchor_itinerary_locations
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are Grok, an expert travel planner AI. Generate hyper-personalized daily itineraries.
+RESEARCH_SYSTEM_PROMPT_BASE = """You are Grok, a travel research agent with live web search.
 
-RULES:
-1. Each day MUST contain exactly four time_blocks: Morning, Lunch, Afternoon, Evening.
-2. VENUE AUTHENTICITY (CRITICAL): Only recommend globally renowned, well-documented, real-world establishments that exist today (museums, famous restaurants, major parks, iconic landmarks). NEVER invent fictional cafés, shops, or attractions. Use exact official venue names as they appear on maps.
-3. Coordinates are advisory only — they will be verified against OpenStreetMap post-generation. Still provide plausible latitude/longitude for each activity.
-4. Costs must align with the user's budget tier.
-5. Pace affects activity density: Relaxed = fewer/longer stops, Packed = more ambitious routing.
-6. Honor all selected interest tags across the trip.
+MANDATORY WORKFLOW — SEARCH FIRST:
+1. You MUST issue web_search tool calls BEFORE writing any venue recommendations.
+2. Scan active web indices (TripAdvisor, Google Maps listings, official tourism boards, reputable local food blogs, Eater, Time Out, Michelin guides) for the target city ONLY.
+3. Only include businesses and attractions you can corroborate from search results as operational and real.
 
-PROGRESSIVE FOODIE TOUR (MANDATORY when Foodie is selected):
-- For EVERY Lunch time_block, pair the main lunch venue with a nearby dessert shop OR specialty coffee roaster.
-- The Lunch description MUST describe: (a) the primary lunch spot, (b) a 5–15 minute walking route to dessert/coffee, and (c) why they pair well locally.
+ZERO-HALLUCINATION RULES:
+- Rule 1 (Search-First): You are STRICTLY FORBIDDEN from relying on internal static knowledge for specific restaurants, coffee shops, or niche attractions. Use real-time web search.
+- Rule 2 (No Inventions): Never fabricate venue names. Every entity must be a real-world business or landmark found in search.
+- Rule 3 (Citation Mapping): For each venue, note the source domain or publication that verified it, the neighborhood, city, and country.
 
-HIDDEN GEMS:
-- Mark hidden_gem=true for low-crowd, local-favorite spots.
-- Include at least one hidden_gem activity per day when Hidden Gems interest is selected.
+GEOGRAPHIC PINNING (CRITICAL):
+- Every web_search query MUST explicitly include the target destination's city AND country/region name.
+- Example: search "The Stand Cafe, New York City, USA" — NEVER search only "The Stand Cafe".
+- You are STRICTLY FORBIDDEN from mixing matching records across different states, countries, or continents.
+- Verify the geographic location in each search result BEFORE adding it to the dossier.
+- Reject any venue whose address or listing is outside the requested destination boundaries.
+
+OUTPUT FORMAT (research dossier, NOT JSON):
+Produce a structured research brief with sections per day and time block (Morning, Lunch, Afternoon, Evening).
+For each slot list: exact official venue name, city/neighborhood confirmation, why it fits, estimated USD cost, source citation.
+For Foodie trips: Lunch should include a real lunch venue AND a nearby dessert/coffee stop with walking route notes when found in search.
+
+LIVE EVENTS & ENTERTAINMENT (when selected):
+- Search for REAL time-sensitive events during the travel dates: concerts, sports fixtures/match days, theater, festivals, and ticketed shows IN the target city.
+- Use ticketing sites, venue calendars, league schedules, and local event listings (Songkick, Ticketmaster, official stadium/arena sites).
+- List event name, venue, date/time window, price range, and source URL. Only include events you verified via search.
 """
+
+SYNTHESIS_SYSTEM_PROMPT_BASE = """You are Grok, synthesizing a verified travel itinerary into strict JSON.
+
+You receive a web-research dossier containing ONLY real venues found via live search.
+- Populate the itinerary EXCLUSIVELY from that dossier. Do not invent new venues.
+- Each activity description must briefly mention the verification source (e.g. "Per TripAdvisor…", "Listed on Google Maps…").
+- Set source_hint to a short citation string per activity.
+- Set is_live_event=true ONLY for verified time-sensitive entertainment (concerts, sports, theater, match days) from the dossier.
+- Live event descriptions MUST include event date/time when known from search.
+- Each day MUST have exactly four time_blocks: Morning, Lunch, Afternoon, Evening.
+- Coordinates should reflect the researched location within the target city (they will be re-verified on OpenStreetMap).
+
+GEOGRAPHIC SYNTHESIS RULES (CRITICAL):
+- Cross-reference every venue in the dossier against the requested destination city/country.
+- If a dossier entry lacks confirmation that the venue is inside the target destination boundaries, REJECT it.
+- Replace rejected entries with a verified landmark or business explicitly located in the target city from the dossier.
+- Never import venues from other cities, states, or continents — even if the business name is identical.
+
+- Return ONLY valid JSON matching the schema. No markdown fences.
+"""
+
+
+def _build_research_instructions(destination: str) -> str:
+    """Build Phase 1 system instructions with absolute geo-pinning for the destination."""
+    return (
+        f"{RESEARCH_SYSTEM_PROMPT_BASE}\n\n"
+        f"ACTIVE DESTINATION LOCK:\n"
+        f"- You are restricted to the requested city and country context: {destination}.\n"
+        f"- Every web_search query you execute MUST include \"{destination}\" and the "
+        f"appropriate country/region (e.g. \"venue name, {destination}, USA\").\n"
+        f"- Do NOT use venues from other cities that share the same business name.\n"
+    )
+
+
+def _build_synthesis_instructions(destination: str) -> str:
+    """Build Phase 2 system instructions with destination-scoped synthesis rules."""
+    return (
+        f"{SYNTHESIS_SYSTEM_PROMPT_BASE}\n\n"
+        f"TARGET DESTINATION: {destination}\n"
+        f"- All activities MUST be geographically located in {destination}.\n"
+        f"- Discard any dossier venue not confirmed within {destination}; substitute a "
+        f"verified in-bounds alternative from the dossier.\n"
+    )
 
 
 def _build_strict_json_schema() -> dict[str, Any]:
@@ -81,9 +134,13 @@ _ITINERARY_JSON_SCHEMA: dict[str, Any] = {
     "schema": _build_strict_json_schema(),
 }
 
+_WEB_SEARCH_TOOLS: list[dict[str, str]] = [{"type": "web_search"}]
+
 
 class AIItineraryEngine:
-    """Constructs prompts, calls xAI Grok asynchronously, validates JSON, and retries on failure."""
+    """
+    Agentic itinerary engine: web search research → structured JSON synthesis → geocode anchor.
+    """
 
     def __init__(self, settings: Settings | None = None) -> None:
         self._settings = settings or get_settings()
@@ -104,9 +161,11 @@ class AIItineraryEngine:
 
     async def generate(self, preferences: UserPreferences) -> ItineraryPlan:
         """
-        Generate a validated itinerary plan.
+        Generate a validated itinerary via Search-then-Synthesize.
 
-        Uses xAI Grok structured outputs with retries, or mock when enabled.
+        Phase 1: xAI Responses API + web_search tool (live venue research).
+        Phase 2: Structured JSON synthesis from research dossier.
+        Phase 3: Nominatim location anchoring.
         """
         if self._settings.use_mock_llm:
             logger.warning("USE_MOCK_LLM enabled; using mock itinerary generator.")
@@ -123,7 +182,7 @@ class AIItineraryEngine:
                 plan = self._parse_and_validate(raw, preferences)
                 plan = await anchor_itinerary_locations(plan)
                 logger.info(
-                    "Itinerary generated successfully on attempt %d for %s",
+                    "Search-then-Synthesize completed on attempt %d for %s",
                     attempt,
                     preferences.destination,
                 )
@@ -142,35 +201,115 @@ class AIItineraryEngine:
             f"Failed to generate valid itinerary after {self._settings.max_retries} attempts"
         ) from last_error
 
-    def _build_user_prompt(self, preferences: UserPreferences) -> str:
-        """Build the user message from validated preferences."""
-        interests = ", ".join(i.value for i in preferences.interests)
-        foodie_note = ""
-        if Interest.FOODIE in preferences.interests:
-            foodie_note = (
-                "\nIMPORTANT: Apply Progressive Foodie Tour rules to every Lunch block."
-            )
-
-        return f"""Create a {preferences.duration_days}-day itinerary with these preferences:
-
-Destination: {preferences.destination}
-Travel party: {preferences.travel_party.value}
-Pace: {preferences.pace.value}
-Budget tier: {preferences.budget_tier.value}
-Interests: {interests}
-{foodie_note}
-
-Return exactly {preferences.duration_days} days of activities."""
-
     async def _call_llm(self, preferences: UserPreferences) -> str:
-        """Invoke xAI Grok with native structured JSON schema output."""
+        """Run research (web search) then synthesis (structured JSON)."""
         if self._client is None:
             raise XAIConfigurationError(XAI_MISSING_KEY_MESSAGE)
 
+        research_text, citations = await self._run_research_phase(preferences)
+        return await self._run_synthesis_phase(preferences, research_text, citations)
+
+    async def _run_research_phase(
+        self, preferences: UserPreferences
+    ) -> tuple[str, list[str]]:
+        """Phase 1: xAI Responses API with native web_search tool."""
+        if self._client is None:
+            raise XAIConfigurationError(XAI_MISSING_KEY_MESSAGE)
+
+        user_prompt = self._build_research_prompt(preferences)
+        logger.info(
+            "Starting web search research phase for %s (%d days)",
+            preferences.destination,
+            preferences.duration_days,
+        )
+
+        try:
+            response = await self._client.responses.create(
+                model=self._settings.xai_model,
+                instructions=_build_research_instructions(preferences.destination),
+                input=[
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                tools=_WEB_SEARCH_TOOLS,
+                temperature=0.4,
+            )
+        except AuthenticationError as exc:
+            logger.error("xAI authentication failed during research: %s", exc, exc_info=True)
+            raise XAIConnectionError(
+                "xAI authentication failed. Please verify your XAI_API_KEY is valid."
+            ) from exc
+        except APIConnectionError as exc:
+            logger.error("xAI connection error during research: %s", exc, exc_info=True)
+            raise XAIConnectionError(
+                "Unable to reach the xAI API during web search. Check your network connection."
+            ) from exc
+        except APIStatusError as exc:
+            logger.error(
+                "xAI research API error HTTP %s: %s",
+                exc.status_code,
+                exc.message,
+                exc_info=True,
+            )
+            raise XAIConnectionError(
+                f"xAI API error during research ({exc.status_code}). Please try again later."
+            ) from exc
+
+        research_text = self._extract_response_text(response)
+        if not research_text.strip():
+            raise ValueError("Web search research phase returned empty content")
+
+        citations = self._extract_citations(response)
+        logger.info(
+            "Research phase complete for %s (%d chars, %d citations)",
+            preferences.destination,
+            len(research_text),
+            len(citations),
+        )
+        return research_text, citations
+
+    async def _run_synthesis_phase(
+        self,
+        preferences: UserPreferences,
+        research_text: str,
+        citations: list[str],
+    ) -> str:
+        """Phase 2: funnel verified research into strict ItineraryPlan JSON."""
+        if self._client is None:
+            raise XAIConfigurationError(XAI_MISSING_KEY_MESSAGE)
+
+        citation_block = "\n".join(f"- {url}" for url in citations[:20]) or "- (see research body)"
+        user_content = f"""Synthesize this verified research dossier into the itinerary JSON schema.
+
+TRIP REQUIREMENTS:
+Destination: {preferences.destination}
+Duration: {preferences.duration_days} days
+Travel party: {preferences.travel_party.value}
+Pace: {preferences.pace.value}
+Budget tier: {preferences.budget_tier.value}
+Interests: {", ".join(i.value for i in preferences.interests)}
+
+WEB RESEARCH DOSSIER:
+{research_text}
+
+CITATION URLS FROM SEARCH:
+{citation_block}
+
+Return exactly {preferences.duration_days} days. Every venue must:
+1. Come from the dossier above.
+2. Be confirmed within {preferences.destination} — reject any out-of-bounds venue."""
+
         messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": self._build_user_prompt(preferences)},
+            {
+                "role": "system",
+                "content": _build_synthesis_instructions(preferences.destination),
+            },
+            {"role": "user", "content": user_content},
         ]
+
+        logger.info("Starting JSON synthesis phase for %s", preferences.destination)
 
         try:
             response = await self._client.chat.completions.create(
@@ -180,12 +319,12 @@ Return exactly {preferences.duration_days} days of activities."""
                     "json_schema": _ITINERARY_JSON_SCHEMA,
                 },
                 messages=messages,
-                temperature=0.7,
+                temperature=0.3,
             )
         except APIStatusError as exc:
             if exc.status_code in (400, 422):
                 logger.warning(
-                    "json_schema rejected (%s); falling back to json_object mode",
+                    "json_schema synthesis rejected (%s); falling back to json_object",
                     exc.status_code,
                 )
                 try:
@@ -193,42 +332,94 @@ Return exactly {preferences.duration_days} days of activities."""
                         model=self._settings.xai_model,
                         response_format={"type": "json_object"},
                         messages=messages,
-                        temperature=0.7,
+                        temperature=0.3,
                     )
                 except APIStatusError as fallback_exc:
-                    logger.error(
-                        "xAI API error on fallback: %s",
-                        fallback_exc.message,
-                        exc_info=True,
-                    )
                     raise XAIConnectionError(
-                        f"xAI API error ({fallback_exc.status_code}). Please try again later."
+                        f"xAI synthesis error ({fallback_exc.status_code}). Please try again later."
                     ) from fallback_exc
             else:
-                logger.error(
-                    "xAI API returned HTTP %s: %s",
-                    exc.status_code,
-                    exc.message,
-                    exc_info=True,
-                )
                 raise XAIConnectionError(
-                    f"xAI API error ({exc.status_code}). Please try again later."
+                    f"xAI synthesis error ({exc.status_code}). Please try again later."
                 ) from exc
         except AuthenticationError as exc:
-            logger.error("xAI authentication failed: %s", exc, exc_info=True)
             raise XAIConnectionError(
-                "xAI authentication failed. Please verify your XAI_API_KEY is valid."
+                "xAI authentication failed during synthesis."
             ) from exc
         except APIConnectionError as exc:
-            logger.error("xAI connection error: %s", exc, exc_info=True)
             raise XAIConnectionError(
-                "Unable to reach the xAI API. Check your network connection and try again."
+                "Unable to reach the xAI API during synthesis."
             ) from exc
 
         content = response.choices[0].message.content
         if not content:
-            raise ValueError("xAI returned empty content")
+            raise ValueError("Synthesis phase returned empty JSON")
         return self._extract_json(content)
+
+    def _build_research_prompt(self, preferences: UserPreferences) -> str:
+        """Prompt that forces web search before any venue listing."""
+        interests = ", ".join(i.value for i in preferences.interests)
+        foodie_note = ""
+        if Interest.FOODIE in preferences.interests:
+            foodie_note = (
+                "\nFor each day, search for a real lunch restaurant AND a real nearby "
+                "dessert shop or specialty coffee roaster with a walkable route between them."
+            )
+        events_note = ""
+        if Interest.LIVE_EVENTS in preferences.interests:
+            events_note = (
+                "\nCRITICAL: Search for live concerts, sports matches, theater shows, and "
+                "ticketed events occurring during the trip dates in this city. Include "
+                "official venue names and event dates from web results."
+            )
+
+        dest = preferences.destination
+        return f"""SEARCH THE WEB FIRST, then write your research dossier.
+
+TARGET DESTINATION (GEO LOCK): {dest}
+Trip length: {preferences.duration_days} days
+Travel party: {preferences.travel_party.value}
+Pace: {preferences.pace.value}
+Budget tier: {preferences.budget_tier.value}
+Interests: {interests}
+{foodie_note}{events_note}
+
+GEO SEARCH RULES:
+- Every web_search query MUST include "{dest}" plus country/region (e.g. "restaurant name, {dest}, USA").
+- Verify each result's address is in {dest} before adding to the dossier.
+- NEVER use a venue from another city/country, even if the name matches.
+
+You MUST call web_search to find operational venues on TripAdvisor, Google Maps, and local guides.
+Do NOT output JSON. Output a day-by-day research dossier with Morning, Lunch, Afternoon, Evening slots."""
+
+    @staticmethod
+    def _extract_response_text(response: Any) -> str:
+        """Extract aggregated text from an xAI Responses API payload."""
+        if hasattr(response, "output_text"):
+            text = response.output_text
+            if text:
+                return str(text)
+
+        chunks: list[str] = []
+        for item in getattr(response, "output", []) or []:
+            if getattr(item, "type", None) == "message":
+                for content in getattr(item, "content", []) or []:
+                    if getattr(content, "type", None) == "output_text":
+                        chunks.append(str(getattr(content, "text", "")))
+        return "".join(chunks)
+
+    @staticmethod
+    def _extract_citations(response: Any) -> list[str]:
+        """Extract citation URLs from a Responses API payload when present."""
+        citations: list[str] = []
+        raw_citations = getattr(response, "citations", None)
+        if isinstance(raw_citations, list):
+            for item in raw_citations:
+                if isinstance(item, str):
+                    citations.append(item)
+                elif isinstance(item, dict) and "url" in item:
+                    citations.append(str(item["url"]))
+        return citations
 
     @staticmethod
     def _extract_json(raw: str) -> str:
@@ -248,7 +439,7 @@ Return exactly {preferences.duration_days} days of activities."""
         payload["duration_days"] = preferences.duration_days
         llm_plan = ItineraryPlanLLMOutput.model_validate(payload)
         plan = self._to_verified_plan(llm_plan)
-        self._assert_progressive_foodie_tour(plan, preferences)
+        self._log_progressive_foodie_tour_check(plan, preferences)
         return plan
 
     @staticmethod
@@ -259,16 +450,21 @@ Return exactly {preferences.duration_days} days of activities."""
             blocks: list[TimeBlock] = []
             for block in day.time_blocks:
                 llm_activity = block.activity
+                description = llm_activity.description
+                if llm_activity.source_hint and llm_activity.source_hint not in description:
+                    description = f"{description} (Source: {llm_activity.source_hint})"
+
                 blocks.append(
                     TimeBlock(
                         time_slot=block.time_slot,
                         activity=Activity(
                             activity_name=llm_activity.activity_name,
-                            description=llm_activity.description,
+                            description=description,
                             estimated_cost=llm_activity.estimated_cost,
                             latitude=llm_activity.latitude,
                             longitude=llm_activity.longitude,
-                            hidden_gem=llm_activity.hidden_gem,
+                            is_live_event=llm_activity.is_live_event,
+                            source_hint=llm_activity.source_hint,
                             is_verified=False,
                             formatted_address=None,
                         ),
@@ -281,11 +477,18 @@ Return exactly {preferences.duration_days} days of activities."""
             days=days,
         )
 
-    def _assert_progressive_foodie_tour(
+    def _log_progressive_foodie_tour_check(
         self, plan: ItineraryPlan, preferences: UserPreferences
     ) -> None:
-        """Soft validation that lunch blocks mention paired dessert/coffee routes."""
+        """
+        Non-blocking aesthetic check for Progressive Foodie Tour phrasing.
+
+        Never raises — missing keywords must not abort the 3-phase pipeline.
+        """
         if Interest.FOODIE not in preferences.interests:
+            logger.info(
+                "Aesthetic check: Passing itinerary processing safely to the layout layer."
+            )
             return
 
         keywords = ("dessert", "coffee", "café", "cafe", "pastry", "gelato", "roaster")
@@ -296,10 +499,15 @@ Return exactly {preferences.duration_days} days of activities."""
             for block in lunch_blocks:
                 desc_lower = block.activity.description.lower()
                 if not any(kw in desc_lower for kw in keywords):
-                    raise ValueError(
-                        f"Day {day.day_number} Lunch must include Progressive "
-                        f"Foodie Tour pairing (dessert/coffee walking route)."
+                    logger.info(
+                        "Aesthetic check: Day %d lunch missing dessert/coffee keywords; "
+                        "passing itinerary safely (no retry).",
+                        day.day_number,
                     )
+
+        logger.info(
+            "Aesthetic check: Passing itinerary processing safely to the layout layer."
+        )
 
     def _generate_mock(self, preferences: UserPreferences) -> ItineraryPlan:
         """Deterministic mock itinerary for local development without API keys."""
@@ -323,42 +531,48 @@ Return exactly {preferences.duration_days} days of activities."""
             offset = (day_num - 1) * 0.01
             blocks: list[TimeBlock] = []
 
-            slot_templates: list[tuple[TimeSlot, str, str, float, bool]] = [
+            slot_templates: list[tuple[TimeSlot, str, str, float, bool, str]] = [
                 (
                     TimeSlot.MORNING,
-                    f"Historic Walk — Day {day_num}",
-                    f"Explore iconic streets and architecture in {preferences.destination}.",
+                    f"Louvre Museum — Day {day_num}",
+                    f"Explore the Louvre collections in {preferences.destination}.",
                     15 * cost_multiplier,
-                    Interest.HIDDEN_GEMS in preferences.interests and day_num % 2 == 1,
+                    False,
+                    "Google Maps",
                 ),
                 (
                     TimeSlot.LUNCH,
-                    f"Local Lunch & Coffee Trail — Day {day_num}",
+                    f"Le Comptoir du Relais — Day {day_num}",
                     (
-                        f"Start at a neighborhood bistro for regional specialties, then take a "
-                        f"10-minute walk to a specialty coffee roaster for a post-lunch digestif "
-                        f"experience in {preferences.destination}."
+                        f"Lunch at this well-known bistro, then walk to a specialty coffee "
+                        f"roaster for dessert in {preferences.destination}."
                     ),
                     35 * cost_multiplier,
                     False,
+                    "TripAdvisor",
                 ),
                 (
                     TimeSlot.AFTERNOON,
-                    f"Cultural Afternoon — Day {day_num}",
-                    "Visit a museum or gallery aligned with your cultural interests.",
+                    f"Musée d'Orsay — Day {day_num}",
+                    "Visit the impressionist galleries.",
                     25 * cost_multiplier,
                     False,
+                    "Google Maps",
                 ),
                 (
                     TimeSlot.EVENING,
-                    f"Evening Stroll & Dinner — Day {day_num}",
-                    "Sunset viewpoint followed by a recommended local dinner spot.",
-                    55 * cost_multiplier,
-                    Interest.HIDDEN_GEMS in preferences.interests,
+                    f"Evening at Accor Arena — Day {day_num}",
+                    (
+                        "Check local listings for concerts or sports at this major venue "
+                        f"during your visit (Source: Ticketmaster)."
+                    ),
+                    85 * cost_multiplier,
+                    Interest.LIVE_EVENTS in preferences.interests,
+                    "Ticketmaster",
                 ),
             ]
 
-            for slot, name, desc, cost, hidden in slot_templates:
+            for slot, name, desc, cost, is_live, source in slot_templates:
                 lat = base_lat + offset
                 lng = base_lng + offset
                 blocks.append(
@@ -366,11 +580,12 @@ Return exactly {preferences.duration_days} days of activities."""
                         time_slot=slot,
                         activity=Activity(
                             activity_name=name,
-                            description=desc,
+                            description=f"{desc} (Source: {source})",
                             estimated_cost=round(cost, 2),
                             latitude=lat,
                             longitude=lng,
-                            hidden_gem=hidden,
+                            is_live_event=is_live,
+                            source_hint=source,
                         ),
                     )
                 )

@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from database import init_db
 from routers.itinerary import router as itinerary_router
+from routers.shared import router as shared_router
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,7 +31,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(
     title="Itinera API",
     description="Hyper-personalized AI itinerary generation service",
-    version="0.2.0",
+    version="0.3.0",
     lifespan=lifespan,
 )
 
@@ -43,6 +44,7 @@ app.add_middleware(
 )
 
 app.include_router(itinerary_router)
+app.include_router(shared_router)
 
 
 @app.get("/health")

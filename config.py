@@ -37,6 +37,11 @@ class Settings(BaseSettings):
         alias="DATABASE_URL",
     )
     database_echo: bool = Field(default=False, alias="DATABASE_ECHO")
+    app_public_url: str = Field(
+        default="http://localhost:8501",
+        alias="APP_PUBLIC_URL",
+    )
+    enable_web_search: bool = Field(default=True, alias="ENABLE_WEB_SEARCH")
 
     @property
     def has_xai_credentials(self) -> bool:

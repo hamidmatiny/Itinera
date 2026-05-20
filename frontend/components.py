@@ -7,12 +7,16 @@ from typing import Literal
 
 import pandas as pd
 import streamlit as st
+from streamlit_folium import st_folium
 
 from frontend.api_client import ItineraryAPIClient
+from frontend.map_routing import build_day_route_map
+from frontend.sharing import render_share_link
 from schemas import (
     BudgetTier,
     Interest,
     ItineraryPlan,
+    ItineraryRecord,
     Pace,
     TimeSlot,
     TravelParty,
@@ -20,6 +24,7 @@ from schemas import (
     daily_budget_allocation,
     day_estimated_cost,
 )
+from services.export_service import generate_itinerary_markdown_from_record
 
 
 @dataclass
@@ -55,6 +60,7 @@ def render_sidebar(client: ItineraryAPIClient) -> SidebarResult:
         "Open Saved Trip",
         use_container_width=True,
         disabled=selected_trip_id is None,
+        key="open_saved_trip_btn",
     )
 
     if load_saved and selected_trip_id:
@@ -95,6 +101,7 @@ def render_sidebar(client: ItineraryAPIClient) -> SidebarResult:
         "Generate Itinerary",
         type="primary",
         use_container_width=True,
+        key="generate_itinerary_btn",
     )
 
     if not submitted:
@@ -118,6 +125,37 @@ def render_sidebar(client: ItineraryAPIClient) -> SidebarResult:
             interests=[Interest(i) for i in interests],
         ),
     )
+
+
+def render_trip_actions(
+    record: ItineraryRecord,
+    *,
+    view_only: bool = False,
+) -> None:
+    """Share link + Markdown export controls (no session-resetting interactions)."""
+    markdown_body = generate_itinerary_markdown_from_record(record)
+    safe_destination = record.plan.destination.replace(" ", "_")[:40]
+
+    st.markdown("### Trip actions")
+    share_col, export_col = st.columns([3, 2])
+
+    with share_col:
+        render_share_link(record.itinerary_id)
+
+    with export_col:
+        st.markdown("**Offline guide**")
+        st.download_button(
+            label="📥 Export Markdown / PDF Guide",
+            data=markdown_body,
+            file_name=f"itinera_{safe_destination}_{record.itinerary_id[:8]}.md",
+            mime="text/markdown",
+            use_container_width=True,
+            help="Save offline; print to PDF from any Markdown viewer.",
+            key=f"export_md_{record.itinerary_id}",
+        )
+
+    if view_only:
+        st.caption("View-only shared trip · generate your own itinerary at the home page.")
 
 
 def render_daily_itinerary(plan: ItineraryPlan, preferences: UserPreferences) -> None:
@@ -162,15 +200,17 @@ def render_daily_itinerary(plan: ItineraryPlan, preferences: UserPreferences) ->
             for block in sorted(day.time_blocks, key=lambda b: _slot_order(b.time_slot)):
                 activity = block.activity
                 st.markdown(f"#### {block.time_slot.value}")
-                gem_badge = " · Hidden Gem" if activity.hidden_gem else ""
+                event_badge = " · 🎫 Live Event" if activity.is_live_event else ""
                 verify_badge = "" if activity.is_verified else " · ⚠️ Location estimated"
-                st.markdown(f"**{activity.activity_name}**{gem_badge}{verify_badge}")
+                st.markdown(f"**{activity.activity_name}**{event_badge}{verify_badge}")
                 location_line = (
                     f"${activity.estimated_cost:,.0f} · "
                     f"({activity.latitude:.4f}, {activity.longitude:.4f})"
                 )
                 if activity.formatted_address and activity.is_verified:
                     location_line += f" · {activity.formatted_address}"
+                elif activity.source_hint:
+                    location_line += f" · Source: {activity.source_hint}"
                 st.caption(location_line)
                 if not activity.is_verified:
                     st.caption(
@@ -180,19 +220,19 @@ def render_daily_itinerary(plan: ItineraryPlan, preferences: UserPreferences) ->
                 st.divider()
 
 
-def render_foodie_hidden_gems(plan: ItineraryPlan) -> None:
-    """Tab 2: culinary highlights and hidden-gem attractions."""
-    st.subheader("Foodie & Hidden Gems")
+def render_foodie_live_events(plan: ItineraryPlan) -> None:
+    """Tab 2: foodie pairings and time-sensitive live entertainment."""
+    st.subheader("Foodie & Live Events")
 
     lunch_blocks = []
-    hidden_gems = []
+    live_events = []
 
     for day in plan.days:
         for block in day.time_blocks:
             if block.time_slot == TimeSlot.LUNCH:
                 lunch_blocks.append((day.day_number, block))
-            if block.activity.hidden_gem:
-                hidden_gems.append((day.day_number, block))
+            if block.activity.is_live_event:
+                live_events.append((day.day_number, block))
 
     st.markdown("### Progressive Foodie Tour — Lunch Pairings")
     if lunch_blocks:
@@ -203,20 +243,34 @@ def render_foodie_hidden_gems(plan: ItineraryPlan) -> None:
     else:
         st.write("No lunch blocks found.")
 
-    st.markdown("### Hidden Gems")
-    if hidden_gems:
-        for day_num, block in hidden_gems:
+    st.markdown("### 🎫 Live Events & Entertainment")
+    st.caption(
+        "Concerts, sports, theater, and match days discovered via real-time web search "
+        "for your travel dates."
+    )
+    if live_events:
+        for day_num, block in live_events:
             activity = block.activity
-            st.success(f"**Day {day_num} — {activity.activity_name}** ({block.time_slot.value})")
+            st.success(
+                f"**Day {day_num} — {activity.activity_name}** ({block.time_slot.value})"
+            )
+            if activity.source_hint:
+                st.caption(f"Source: {activity.source_hint}")
             st.write(activity.description)
     else:
-        st.write("No hidden gems flagged in this itinerary. Try selecting the Hidden Gems interest.")
+        st.write(
+            "No live events flagged. Select **Live Events & Entertainment** and regenerate "
+            "to search for concerts, sports, theater, and match days during your trip."
+        )
 
 
 def render_map_view(plan: ItineraryPlan) -> None:
-    """Tab 3: sequential per-day maps with coordinate summary tables."""
+    """Tab 3: Folium route maps with sequential walking/driving paths."""
     st.subheader("Map View — Daily Routes")
-    st.caption("Activities are plotted in Morning → Lunch → Afternoon → Evening order per day.")
+    st.caption(
+        "Connected trails follow **Morning → Lunch → Afternoon → Evening**. "
+        "Numbered pins show stop order."
+    )
 
     if not plan.days:
         st.warning("No coordinates to display.")
@@ -231,10 +285,11 @@ def render_map_view(plan: ItineraryPlan) -> None:
         ):
             activity = block.activity
             verification_note = (
-                "Verified"
+                "✅ Verified"
                 if activity.is_verified
                 else "⚠️ Location estimated - double check venue status"
             )
+            event_note = "🎫 Live Event" if activity.is_live_event else ""
             rows.append(
                 {
                     "stop": order,
@@ -243,12 +298,12 @@ def render_map_view(plan: ItineraryPlan) -> None:
                     "latitude": round(activity.latitude, 5),
                     "longitude": round(activity.longitude, 5),
                     "verification": verification_note,
-                    "hidden_gem": activity.hidden_gem,
+                    "live_event": event_note,
                 }
             )
 
         df = pd.DataFrame(rows)
-        unverified_count = sum(1 for r in rows if r["verification"].startswith("⚠️"))
+        unverified_count = sum(1 for r in rows if "estimated" in r["verification"])
         if unverified_count:
             st.warning(
                 f"{unverified_count} stop(s) on Day {day.day_number} use estimated placements "
@@ -258,18 +313,32 @@ def render_map_view(plan: ItineraryPlan) -> None:
         map_col, table_col = st.columns([3, 2])
 
         with map_col:
-            st.map(
-                df,
-                latitude="latitude",
-                longitude="longitude",
-                size=100,
-                color="#1f77b4",
-            )
+            try:
+                route_map = build_day_route_map(day, plan.destination)
+                st_folium(route_map, width=None, height=420, returned_objects=[])
+            except Exception as exc:
+                st.warning(f"Route map unavailable; showing point map. ({exc})")
+                st.map(
+                    df,
+                    latitude="latitude",
+                    longitude="longitude",
+                    size=100,
+                )
 
         with table_col:
-            st.markdown("**Localized coordinates**")
+            st.markdown("**Route sequence & coordinates**")
             st.dataframe(
-                df[["stop", "time_slot", "activity", "latitude", "longitude", "verification"]],
+                df[
+                    [
+                        "stop",
+                        "time_slot",
+                        "activity",
+                        "latitude",
+                        "longitude",
+                        "verification",
+                        "live_event",
+                    ]
+                ],
                 use_container_width=True,
                 hide_index=True,
             )

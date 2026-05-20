@@ -13,6 +13,9 @@ Hyper-personalized travel itineraries powered by **xAI Grok**, with a FastAPI ba
 - **Structured Grok outputs**: native `json_schema` with Pydantic-backed validation
 - **Geocoding fallbacks**: `geopy` + city bounding-box offsets so maps never break
 - **Saved trips**: reload historical itineraries from the sidebar without re-calling xAI
+- **Route maps**: Folium polylines connect daily stops in timeline order
+- **Share links**: public `GET /shared/itinerary/{uuid}` + `?trip=` view-only Streamlit mode
+- **Offline export**: Markdown travel guides via `st.download_button`
 
 ## Project structure
 
@@ -90,6 +93,7 @@ Open http://localhost:8501, configure your trip in the sidebar, and click **Gene
 | `POST` | `/api/itinerary/generate` | Generate and store an itinerary |
 | `GET` | `/api/itinerary/{id}` | Fetch itinerary by ID |
 | `GET` | `/api/itinerary` | List all stored itineraries |
+| `GET` | `/shared/itinerary/{id}` | Public view-only itinerary (share token) |
 
 ### Example request
 

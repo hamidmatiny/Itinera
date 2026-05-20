@@ -73,20 +73,27 @@ class ItineraryAPIClient:
 
     def get_itinerary(self, itinerary_id: str) -> ItineraryRecord:
         """Load a saved itinerary without re-invoking xAI."""
+        return self._fetch_record(f"/api/itinerary/{itinerary_id}", "saved itinerary")
+
+    def get_shared_itinerary(self, itinerary_id: str) -> ItineraryRecord:
+        """Load a publicly shared itinerary (view-only)."""
+        return self._fetch_record(
+            f"/shared/itinerary/{itinerary_id}",
+            "shared itinerary",
+        )
+
+    def _fetch_record(self, path: str, label: str) -> ItineraryRecord:
+        """GET an itinerary record from the API."""
         try:
             with httpx.Client(timeout=15.0) as client:
-                response = client.get(
-                    f"{self._base_url}/api/itinerary/{itinerary_id}"
-                )
+                response = client.get(f"{self._base_url}{path}")
                 response.raise_for_status()
                 return ItineraryRecord.model_validate(response.json())
         except httpx.HTTPStatusError as exc:
             detail = self._extract_error_detail(exc.response)
             raise ItineraryAPIError(detail, status_code=exc.response.status_code) from exc
         except httpx.HTTPError as exc:
-            raise ItineraryAPIError(
-                "Failed to load the saved itinerary."
-            ) from exc
+            raise ItineraryAPIError(f"Failed to load the {label}.") from exc
 
     @staticmethod
     def _extract_error_detail(response: httpx.Response) -> str:

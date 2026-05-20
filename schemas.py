@@ -39,7 +39,7 @@ class Interest(str, Enum):
     FOODIE = "Foodie"
     CULTURE = "Culture"
     NATURE = "Nature"
-    HIDDEN_GEMS = "Hidden Gems"
+    LIVE_EVENTS = "Live Events & Entertainment"
 
 
 class TimeSlot(str, Enum):
@@ -67,6 +67,20 @@ class UserPreferences(BaseModel):
         """Normalize destination input."""
         return value.strip()
 
+    @field_validator("interests", mode="before")
+    @classmethod
+    def migrate_legacy_interests(cls, value: list) -> list:
+        """Map deprecated Hidden Gems interest to Live Events."""
+        if not isinstance(value, list):
+            return value
+        migrated: list = []
+        for item in value:
+            if item == "Hidden Gems":
+                migrated.append(Interest.LIVE_EVENTS.value)
+            else:
+                migrated.append(item)
+        return migrated
+
 
 class ActivityLLMOutput(BaseModel):
     """Activity fields produced by the LLM before map verification."""
@@ -76,7 +90,19 @@ class ActivityLLMOutput(BaseModel):
     estimated_cost: Annotated[float, Field(ge=0)]
     latitude: Annotated[float, Field(ge=-90, le=90)]
     longitude: Annotated[float, Field(ge=-180, le=180)]
-    hidden_gem: bool = False
+    is_live_event: bool = False
+    source_hint: str | None = Field(
+        default=None,
+        description="Brief citation of the verified source (e.g. TripAdvisor, Google Maps).",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_hidden_gem(cls, data: object) -> object:
+        """Accept legacy ``hidden_gem`` JSON from older itineraries."""
+        if isinstance(data, dict) and "hidden_gem" in data and "is_live_event" not in data:
+            data = {**data, "is_live_event": data["hidden_gem"]}
+        return data
 
 
 class Activity(ActivityLLMOutput):
