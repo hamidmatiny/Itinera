@@ -117,6 +117,18 @@ curl -X POST http://127.0.0.1:8000/api/itinerary/generate \
 - **Business logic** lives in `services/ai_engine.py` (prompts, JSON parsing, validation, retries).
 - **Presentation** lives in `frontend/components.py` and `app.py`.
 - **Data layer** is `database.py` + `services/db_service.py`. Set `DATABASE_URL=postgresql+asyncpg://...` for production.
+- **Screenshots and examples** are available in the [`screenshots/`](screenshots/) folder.
+
+## GitHub topics
+
+Recommended repository topics:
+
+- `travel`
+- `itinerary`
+- `grok`
+- `fastapi`
+- `streamlit`
+- `ai-agent`
 
 ## License
 
