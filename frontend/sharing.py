@@ -5,6 +5,7 @@ from __future__ import annotations
 import streamlit as st
 
 from config import get_settings
+from frontend.theme import render_share_snippet
 
 
 def build_share_url(itinerary_id: str) -> str:
@@ -14,10 +15,9 @@ def build_share_url(itinerary_id: str) -> str:
 
 
 def render_share_link(itinerary_id: str) -> None:
-    """Display a selectable share URL without HTML clipboard overlays."""
+    """Display a styled share URL snippet without HTML clipboard overlays."""
     share_url = build_share_url(itinerary_id)
-    st.markdown("**Share this trip** — select and copy:")
-    st.code(share_url, language="text")
+    render_share_snippet(share_url)
 
 
 def get_shared_trip_id_from_query() -> str | None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import html
 from dataclasses import dataclass
 from typing import Literal
 
@@ -12,6 +13,7 @@ from streamlit_folium import st_folium
 from frontend.api_client import ItineraryAPIClient
 from frontend.map_routing import build_day_route_map
 from frontend.sharing import render_share_link
+from frontend.theme import render_html, render_itinerary_card, render_metric_pills
 from schemas import (
     BudgetTier,
     Interest,
@@ -136,16 +138,18 @@ def render_trip_actions(
     markdown_body = generate_itinerary_markdown_from_record(record)
     safe_destination = record.plan.destination.replace(" ", "_")[:40]
 
-    st.markdown("### Trip actions")
+    render_html(
+        '<div class="section-label" style="margin-top:8px;">Trip actions</div>'
+    )
     share_col, export_col = st.columns([3, 2])
 
     with share_col:
         render_share_link(record.itinerary_id)
 
     with export_col:
-        st.markdown("**Offline guide**")
+        render_html('<div class="section-label">Offline guide</div>')
         st.download_button(
-            label="📥 Export Markdown / PDF Guide",
+            label="Export Markdown / PDF Guide",
             data=markdown_body,
             file_name=f"itinera_{safe_destination}_{record.itinerary_id[:8]}.md",
             mime="text/markdown",
@@ -159,70 +163,96 @@ def render_trip_actions(
 
 
 def render_daily_itinerary(plan: ItineraryPlan, preferences: UserPreferences) -> None:
-    """Tab 1: expandable daily schedule with budget burn-rate metrics."""
+    """Tab 1: daily schedule with glassmorphism cards and budget badge pills."""
     total_cost = _compute_total_cost(plan)
     daily_budget = daily_budget_allocation(preferences.budget_tier)
     trip_budget = daily_budget * plan.duration_days
+    delta_total = f"${total_cost - trip_budget:+,.0f} vs tier"
 
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Destination", plan.destination)
-    col2.metric("Duration", f"{plan.duration_days} days")
-    col3.metric("Trip budget (tier)", f"${trip_budget:,.0f}")
-    col4.metric("Est. total spend", f"${total_cost:,.0f}", delta=f"${total_cost - trip_budget:+,.0f}")
+    render_metric_pills(
+        [
+            ("Destination", plan.destination, None),
+            ("Duration", f"{plan.duration_days} days", None),
+            ("Trip budget", f"${trip_budget:,.0f}", None),
+            ("Est. spend", f"${total_cost:,.0f}", delta_total),
+        ]
+    )
 
-    st.markdown("### Daily budget burn rate")
-    burn_cols = st.columns(len(plan.days))
-    for idx, day in enumerate(plan.days):
+    render_html('<div class="section-label">Daily budget burn rate</div>')
+    burn_items: list[tuple[str, str, str | None]] = []
+    for day in plan.days:
         actual = day_estimated_cost(day)
         allocated = daily_budget
         delta = actual - allocated
-        burn_cols[idx].metric(
-            f"Day {day.day_number}",
-            f"${actual:,.0f}",
-            delta=f"${delta:+,.0f} vs ${allocated:,.0f}/day",
-            delta_color="inverse" if delta > 0 else "normal",
+        burn_items.append(
+            (
+                f"Day {day.day_number}",
+                f"${actual:,.0f}",
+                f"${delta:+,.0f} vs ${allocated:,.0f}/day",
+            )
         )
+    render_metric_pills(burn_items)
 
     for day in plan.days:
         day_cost = day_estimated_cost(day)
         allocated = daily_budget
         over_under = day_cost - allocated
-        with st.expander(
-            f"Day {day.day_number} — ${day_cost:,.0f} spent "
-            f"({'over' if over_under > 0 else 'under'} budget by ${abs(over_under):,.0f})",
-            expanded=day.day_number == 1,
-        ):
-            m1, m2, m3 = st.columns(3)
-            m1.metric("Allocated / day", f"${allocated:,.0f}")
-            m2.metric("AI estimate", f"${day_cost:,.0f}")
-            m3.metric("Burn rate", f"{(day_cost / allocated * 100):.0f}%")
+        direction = "over" if over_under > 0 else "under"
+        render_html(
+            f"""
+            <div class="day-section-title">
+                Day {day.day_number}
+                <span style="font-size:0.85rem;font-weight:500;color:rgba(244,246,251,0.55);">
+                    · ${day_cost:,.0f} spent ({direction} budget by ${abs(over_under):,.0f})
+                </span>
+            </div>
+            """
+        )
+        render_metric_pills(
+            [
+                ("Allocated / day", f"${allocated:,.0f}", None),
+                ("AI estimate", f"${day_cost:,.0f}", None),
+                ("Burn rate", f"{(day_cost / allocated * 100):.0f}%", None),
+            ]
+        )
 
-            for block in sorted(day.time_blocks, key=lambda b: _slot_order(b.time_slot)):
-                activity = block.activity
-                st.markdown(f"#### {block.time_slot.value}")
-                event_badge = " · 🎫 Live Event" if activity.is_live_event else ""
-                verify_badge = "" if activity.is_verified else " · ⚠️ Location estimated"
-                st.markdown(f"**{activity.activity_name}**{event_badge}{verify_badge}")
-                location_line = (
-                    f"${activity.estimated_cost:,.0f} · "
-                    f"({activity.latitude:.4f}, {activity.longitude:.4f})"
-                )
-                if activity.formatted_address and activity.is_verified:
-                    location_line += f" · {activity.formatted_address}"
-                elif activity.source_hint:
-                    location_line += f" · Source: {activity.source_hint}"
-                st.caption(location_line)
-                if not activity.is_verified:
-                    st.caption(
-                        "⚠️ Location estimated — double-check venue status before visiting."
-                    )
-                st.write(activity.description)
-                st.divider()
+        for block in sorted(day.time_blocks, key=lambda b: _slot_order(b.time_slot)):
+            activity = block.activity
+            badges: list[tuple[str, str]] = [("slot", block.time_slot.value)]
+            if activity.is_live_event:
+                badges.append(("live", "Live Event"))
+            if activity.is_verified:
+                badges.append(("verified", "Verified"))
+            else:
+                badges.append(("warn", "Location estimated"))
+
+            meta_parts = [
+                f"${activity.estimated_cost:,.0f}",
+                f"({activity.latitude:.4f}, {activity.longitude:.4f})",
+            ]
+            if activity.formatted_address and activity.is_verified:
+                meta_parts.append(activity.formatted_address)
+            elif activity.source_hint:
+                meta_parts.append(f"Source: {activity.source_hint}")
+
+            warning = None
+            if not activity.is_verified:
+                warning = "Location estimated — double-check venue status before visiting."
+
+            render_itinerary_card(
+                time_slot=block.time_slot.value,
+                title=activity.activity_name,
+                description=activity.description,
+                meta=" · ".join(meta_parts),
+                badges=badges,
+                is_live_event=activity.is_live_event,
+                warning=warning,
+            )
 
 
 def render_foodie_live_events(plan: ItineraryPlan) -> None:
     """Tab 2: foodie pairings and time-sensitive live entertainment."""
-    st.subheader("Foodie & Live Events")
+    render_html('<div class="section-label">Foodie & Live Events</div>')
 
     lunch_blocks = []
     live_events = []
@@ -234,16 +264,23 @@ def render_foodie_live_events(plan: ItineraryPlan) -> None:
             if block.activity.is_live_event:
                 live_events.append((day.day_number, block))
 
-    st.markdown("### Progressive Foodie Tour — Lunch Pairings")
+    render_html(
+        '<div class="day-section-title">Progressive Foodie Tour — Lunch Pairings</div>'
+    )
     if lunch_blocks:
         for day_num, block in lunch_blocks:
             activity = block.activity
-            st.info(f"**Day {day_num} — {activity.activity_name}**")
-            st.write(activity.description)
+            render_itinerary_card(
+                time_slot="Lunch",
+                title=f"Day {day_num} — {activity.activity_name}",
+                description=activity.description,
+                meta=f"${activity.estimated_cost:,.0f} · Lunch slot",
+                badges=[("slot", "Lunch"), ("verified" if activity.is_verified else "warn", "Foodie")],
+            )
     else:
-        st.write("No lunch blocks found.")
+        render_html('<div class="empty-state">No lunch blocks found.</div>')
 
-    st.markdown("### 🎫 Live Events & Entertainment")
+    render_html('<div class="day-section-title">Live Events & Entertainment</div>')
     st.caption(
         "Concerts, sports, theater, and match days discovered via real-time web search "
         "for your travel dates."
@@ -251,33 +288,39 @@ def render_foodie_live_events(plan: ItineraryPlan) -> None:
     if live_events:
         for day_num, block in live_events:
             activity = block.activity
-            st.success(
-                f"**Day {day_num} — {activity.activity_name}** ({block.time_slot.value})"
-            )
+            meta = f"Day {day_num} · {block.time_slot.value}"
             if activity.source_hint:
-                st.caption(f"Source: {activity.source_hint}")
-            st.write(activity.description)
+                meta += f" · Source: {activity.source_hint}"
+            render_itinerary_card(
+                time_slot=block.time_slot.value,
+                title=activity.activity_name,
+                description=activity.description,
+                meta=meta,
+                badges=[("live", "Live Event"), ("slot", block.time_slot.value)],
+                is_live_event=True,
+            )
     else:
-        st.write(
-            "No live events flagged. Select **Live Events & Entertainment** and regenerate "
-            "to search for concerts, sports, theater, and match days during your trip."
+        render_html(
+            '<div class="empty-state">No live events flagged. Select Live Events & '
+            "Entertainment and regenerate to search for concerts, sports, theater, "
+            "and match days during your trip.</div>"
         )
 
 
 def render_map_view(plan: ItineraryPlan) -> None:
     """Tab 3: Folium route maps with sequential walking/driving paths."""
-    st.subheader("Map View — Daily Routes")
+    render_html('<div class="section-label">Map View — Daily Routes</div>')
     st.caption(
-        "Connected trails follow **Morning → Lunch → Afternoon → Evening**. "
+        "Connected trails follow Morning → Lunch → Afternoon → Evening. "
         "Numbered pins show stop order."
     )
 
     if not plan.days:
-        st.warning("No coordinates to display.")
+        render_html('<div class="empty-state">No coordinates to display.</div>')
         return
 
     for day in plan.days:
-        st.markdown(f"#### Day {day.day_number}")
+        render_html(f'<div class="day-section-title">Day {day.day_number}</div>')
         rows = []
         for order, block in enumerate(
             sorted(day.time_blocks, key=lambda b: _slot_order(b.time_slot)),
@@ -285,11 +328,11 @@ def render_map_view(plan: ItineraryPlan) -> None:
         ):
             activity = block.activity
             verification_note = (
-                "✅ Verified"
+                "Verified"
                 if activity.is_verified
-                else "⚠️ Location estimated - double check venue status"
+                else "Location estimated - double check venue status"
             )
-            event_note = "🎫 Live Event" if activity.is_live_event else ""
+            event_note = "Live Event" if activity.is_live_event else ""
             rows.append(
                 {
                     "stop": order,
@@ -305,9 +348,13 @@ def render_map_view(plan: ItineraryPlan) -> None:
         df = pd.DataFrame(rows)
         unverified_count = sum(1 for r in rows if "estimated" in r["verification"])
         if unverified_count:
-            st.warning(
-                f"{unverified_count} stop(s) on Day {day.day_number} use estimated placements "
-                "— venues could not be confirmed on OpenStreetMap."
+            render_html(
+                f"""
+                <div class="status-banner status-banner--warn">
+                    {html.escape(str(unverified_count))} stop(s) on Day {day.day_number}
+                    use estimated placements — venues could not be confirmed on OpenStreetMap.
+                </div>
+                """
             )
 
         map_col, table_col = st.columns([3, 2])
@@ -326,7 +373,7 @@ def render_map_view(plan: ItineraryPlan) -> None:
                 )
 
         with table_col:
-            st.markdown("**Route sequence & coordinates**")
+            render_html('<div class="section-label">Route sequence & coordinates</div>')
             st.dataframe(
                 df[
                     [
@@ -342,8 +389,6 @@ def render_map_view(plan: ItineraryPlan) -> None:
                 use_container_width=True,
                 hide_index=True,
             )
-
-        st.divider()
 
 
 def _compute_total_cost(plan: ItineraryPlan) -> float:

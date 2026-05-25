@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 import streamlit as st
 
 from frontend.api_client import ItineraryAPIClient, ItineraryAPIError
@@ -15,6 +13,13 @@ from frontend.components import (
     render_trip_actions,
 )
 from frontend.sharing import get_shared_trip_id_from_query
+from frontend.theme import (
+    inject_global_theme,
+    inject_inline_style,
+    render_hero_header,
+    render_loading_shell,
+    render_status_banner,
+)
 from schemas import ItineraryPlan, ItineraryRecord
 
 st.set_page_config(
@@ -24,13 +29,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-LOADING_MESSAGES = [
-    "Scanning live web results for verified venues…",
-    "Searching concerts, sports, theater, and match days…",
-    "Synthesizing your search-backed itinerary…",
-    "Anchoring coordinates on OpenStreetMap…",
-    "Finalizing your daily timeline…",
-]
+inject_global_theme()
 
 
 def _init_session_state() -> None:
@@ -58,16 +57,13 @@ def _get_active_record() -> ItineraryRecord | None:
 def _render_api_error(exc: ItineraryAPIError) -> None:
     """Display a user-friendly error based on API failure type."""
     if exc.status_code == 503:
-        st.error("**Configuration required**")
-        st.info(exc.message)
+        render_status_banner("Configuration required — " + exc.message, variant="warn")
     elif exc.status_code == 502:
-        st.error("**xAI service unavailable**")
-        st.warning(exc.message)
+        render_status_banner("xAI service unavailable — " + exc.message, variant="warn")
     elif exc.status_code == 404:
-        st.error("**Trip not found**")
-        st.info(exc.message)
+        render_status_banner("Trip not found — " + exc.message, variant="info")
     else:
-        st.error(f"**Failed to load itinerary** — {exc.message}")
+        render_status_banner(f"Failed to load itinerary — {exc.message}", variant="warn")
 
 
 def _render_dashboard(
@@ -82,12 +78,19 @@ def _render_dashboard(
     itinerary_id = record.itinerary_id
 
     if view_only:
-        st.info(f"🔗 **Shared trip** · {plan.destination} · {plan.duration_days} days")
+        render_status_banner(
+            f"Shared trip · {plan.destination} · {plan.duration_days} days",
+            variant="info",
+        )
     elif from_saved:
-        st.success(f"Loaded saved trip · `{itinerary_id[:8]}…` · {plan.destination}")
+        render_status_banner(
+            f"Loaded saved trip · {itinerary_id[:8]}… · {plan.destination}",
+            variant="success",
+        )
     else:
-        st.success(
-            f"Search-verified itinerary ready · ID `{itinerary_id[:8]}…` · {plan.destination}"
+        render_status_banner(
+            f"Search-verified itinerary ready · {itinerary_id[:8]}… · {plan.destination}",
+            variant="success",
         )
 
     render_trip_actions(record, view_only=view_only)
@@ -108,12 +111,12 @@ def _render_dashboard(
 
 def _render_shared_view(client: ItineraryAPIClient, trip_id: str) -> None:
     """View-only mode when ``?trip=<uuid>`` is present in the URL."""
-    st.markdown(
-        "<style>[data-testid='stSidebar']{display:none;}</style>",
-        unsafe_allow_html=True,
+    inject_inline_style("[data-testid='stSidebar']{display:none;}")
+    render_hero_header(
+        kicker="Shared itinerary",
+        title="Itinera",
+        subtitle=f"View-only trip · {trip_id[:8]}…",
     )
-    st.title("Itinera")
-    st.markdown(f"### Shared itinerary · `{trip_id[:8]}…`")
 
     try:
         record = client.get_shared_itinerary(trip_id)
@@ -143,20 +146,22 @@ def _handle_sidebar_actions(
 
     if sidebar.action == "generate" and sidebar.preferences:
         preferences = sidebar.preferences
-        progress = st.empty()
-        with st.spinner("Researching verified venues with Grok web search…"):
-            try:
-                for message in LOADING_MESSAGES[:-1]:
-                    progress.caption(message)
-                    time.sleep(0.4)
-                progress.caption(LOADING_MESSAGES[-1])
-                response = client.generate(preferences)
-            except ItineraryAPIError as exc:
-                _render_api_error(exc)
-                return True
-            except Exception as exc:
-                st.error(f"An unexpected error occurred: {exc}")
-                return True
+        loader = st.empty()
+        try:
+            with loader.container():
+                render_loading_shell(
+                    "Researching verified venues with Grok web search — "
+                    "this may take a minute…"
+                )
+            response = client.generate(preferences)
+        except ItineraryAPIError as exc:
+            _render_api_error(exc)
+            return True
+        except Exception as exc:
+            render_status_banner(f"An unexpected error occurred: {exc}", variant="warn")
+            return True
+        finally:
+            loader.empty()
 
         record = ItineraryRecord(
             itinerary_id=response.itinerary_id,
@@ -178,22 +183,28 @@ def main() -> None:
     shared_trip_id = get_shared_trip_id_from_query()
     if shared_trip_id:
         if not client.health():
-            st.error("Backend API is not reachable. Shared trips require the API server.")
+            render_status_banner(
+                "Backend API is not reachable. Shared trips require the API server.",
+                variant="warn",
+            )
             st.code("uvicorn main:app --reload", language="bash")
             return
         _render_shared_view(client, shared_trip_id)
         return
 
-    st.title("Itinera")
-    st.markdown(
-        "Hyper-personalized **AI-powered itineraries** — **Search-then-Synthesize** with "
-        "xAI Grok live web search, then map-verified coordinates."
+    render_hero_header(
+        kicker="Itinera Studio",
+        title="Itinera",
+        subtitle=(
+            "Hyper-personalized AI itineraries — Search-then-Synthesize with "
+            "xAI Grok live web search, then map-verified coordinates."
+        ),
     )
 
     if not client.health():
-        st.warning(
-            "Backend API is not reachable. Start it with: "
-            "`uvicorn main:app --reload`"
+        render_status_banner(
+            "Backend API is not reachable. Start it with: uvicorn main:app --reload",
+            variant="warn",
         )
 
     sidebar = render_sidebar(client)
@@ -204,9 +215,10 @@ def main() -> None:
         from_saved = sidebar.action != "generate"
         _render_dashboard(active_record, from_saved=from_saved)
     elif not had_error and active_record is None:
-        st.info(
-            "Select a **Saved Trip** to reopen without calling xAI, or configure a "
-            "new trip and click **Generate Itinerary**."
+        render_status_banner(
+            "Select a Saved Trip to reopen without calling xAI, or configure a "
+            "new trip and click Generate Itinerary.",
+            variant="info",
         )
 
 
